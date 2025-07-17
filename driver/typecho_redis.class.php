@@ -1,6 +1,5 @@
 <?php
 
-<<<<<<< HEAD
 declare(strict_types=1);
 
 /**
@@ -43,52 +42,6 @@ class typecho_redis implements TpCache
     public static function getInstance(object $option): self
     {
         if (self::$_instance === null) {
-=======
-/**
- * Redis缓存驱动类
- * 
- * 支持PHP 7.5+和最新的Redis扩展
- * 
- * @package TpRedis
- * @author 风之翼灵
- * @version 1.0.1
- * @link http://www.fungj.com
- */
-class typecho_redis implements TpCache {
-
-    private static $_instance = null;
-    private $redis = null;
-    private $host = '127.0.0.1';
-    private $port = 6379;
-    private $password = '';
-    private $database = 0;
-    private $prefix = 'typecho_';
-    private $expire = 86400;
-
-    private function __construct($option = null) {
-        // 兼容数组和对象类型的配置
-        if (is_array($option)) {
-            $this->host = isset($option['host']) ? $option['host'] : $this->host;
-            $this->port = isset($option['port']) ? $option['port'] : $this->port;
-            $this->password = isset($option['password']) ? $option['password'] : $this->password;
-            $this->database = isset($option['database']) ? $option['database'] : $this->database;
-            $this->prefix = isset($option['prefix']) ? $option['prefix'] : $this->prefix;
-            $this->expire = isset($option['expire']) ? intval($option['expire']) : $this->expire;
-        } else if (is_object($option)) {
-            $this->host = isset($option->host) ? $option->host : $this->host;
-            $this->port = isset($option->port) ? $option->port : $this->port;
-            $this->password = isset($option->password) ? $option->password : $this->password;
-            $this->database = isset($option->database) ? $option->database : $this->database;
-            $this->prefix = isset($option->prefix) ? $option->prefix : $this->prefix;
-            $this->expire = isset($option->expire) ? intval($option->expire) : $this->expire;
-        }
-        
-        $this->init($option);
-    }
-
-    static public function getInstance($option) {
-        if (is_null(self::$_instance) || !isset(self::$_instance)) {
->>>>>>> origin/main
             self::$_instance = new self($option);
         }
         return self::$_instance;
