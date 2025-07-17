@@ -6,7 +6,7 @@ if (!defined('__TYPECHO_ROOT_DIR__')) exit;
  *
  * @package TpRedis
  * @author 风之翼灵
- * @version 1.0.1
+ * @version 1.0.2
  * @link http://www.fungj.com
  */
 class TpRedis_Plugin implements Typecho_Plugin_Interface
@@ -31,6 +31,7 @@ class TpRedis_Plugin implements Typecho_Plugin_Interface
 
         //评论
         Typecho_Plugin::factory('Widget_Feedback')->finishComment = array('TpRedis_Plugin', 'comment_update');
+        Typecho_Plugin::factory('Widget_Comments_Edit')->finishEdit = array('TpRedis_Plugin', 'comment_approve_update');
 
 
         return '插件安装成功,请设置需要缓存的页面';
@@ -140,6 +141,10 @@ class TpRedis_Plugin implements Typecho_Plugin_Interface
         $list = array('0' => '关闭', '1' => '清除所有数据');
         $element = new Typecho_Widget_Helper_Form_Element_Radio('is_clean', $list, 0, '清除所有缓存', '选择开启后保存设置会清除所有缓存数据');
         $form->addInput($element);
+
+        $flush_options = array('0' => '关闭', '1' => '刷新对应页面缓存（推荐）', '2' => '刷新整站缓存');
+        $element = new Typecho_Widget_Helper_Form_Element_Radio('auto_flush_on_approve', $flush_options, '1', '评论审核后自动刷新缓存', '开启后，当后台审核通过评论时，会自动刷新对应页面的缓存（或整站），确保前端及时显示新评论。');
+        $form->addInput($element);
     }
 
     /**
@@ -212,25 +217,45 @@ class TpRedis_Plugin implements Typecho_Plugin_Interface
         }
 
         try {
-            $data = self::get(self::$path);
-            if ($data != false) {
-                $data = unserialize($data);
-                //如果超时
-                if ($data['c_time'] + self::$plugin_config->expire <= time()) {
-                    $data['c_time'] = $data['c_time'] + 20;
-                    self::set(self::$path, serialize($data));
+            $raw_data = self::get(self::$path);
+            if ($raw_data !== false) {
+                $data = @unserialize($raw_data);
+                if ($data === false || !is_array($data) || !isset($data['c_time']) || !isset($data['html'])) {
+                    // Invalid serialized data, delete and continue rendering
+                    self::delete(self::$path);
+                    if (self::$plugin_config->is_debug == '1') {
+                        echo "<!-- TpRedis Debug: Invalid cache for " . self::$path . ", deleted and re-rendering -->";
+                    }
                 } else {
-                    if ($data['html']) {
+                    // Check expiration
+                    if ($data['c_time'] + self::$plugin_config->expire <= time()) {
+                        $data['c_time'] = time();  // Reset to current time instead of +20 to properly expire
+                        self::set(self::$path, serialize($data));
+                        if (self::$plugin_config->is_debug == '1') {
+                            echo "<!-- TpRedis Debug: Cache expired for " . self::$path . ", reset expiration -->";
+                        }
+                    } else {
+                        if (self::$plugin_config->is_debug == '1') {
+                            echo "<!-- TpRedis Debug: Cache hit for " . self::$path . " -->";
+                        }
                         echo $data['html'];
                         $end = microtime(true);
                         $time = number_format(($end - $start), 6);
+                        if (self::$plugin_config->is_debug == '1') {
+                            echo "<!-- TpRedis Debug: Render time: $time s -->";
+                        }
                         die;
                     }
                 }
+            } else {
+                if (self::$plugin_config->is_debug == '1') {
+                    echo "<!-- TpRedis Debug: Cache miss for " . self::$path . ", rendering new -->";
+                }
             }
-
         } catch (Exception $e) {
-            echo "<!-- TpRedis错误: " . $e->getMessage() . " -->";
+            if (self::$plugin_config->is_debug == '1') {
+                echo "<!-- TpRedis Error: " . $e->getMessage() . " -->";
+            }
         }
         // 先进行一次刷新
         if (function_exists('ob_flush')) {
@@ -379,17 +404,157 @@ class TpRedis_Plugin implements Typecho_Plugin_Interface
      * @param string $api api地址
      * @return void
      */
-    public static function comment_update($comment)
+    public static function comment_update()
     {
-        $req = new Typecho_Request();
-        // 获取评论的PATH_INFO
-        $path_info = $req->getPathInfo();
-        // 删除最后的 /comment就是需删除的key
-        $article_url = preg_replace('/\/comment$/i','',$path_info);
+        $args = func_get_args();
+        $comment_array = null;
 
-        self::init($article_url);
-        
-        self::delete($article_url);
+        // 优先假设标准顺序: 第一个参数是 array $comment
+        if (isset($args[0]) && is_array($args[0]) && isset($args[0]['cid'])) {
+            $comment_array = $args[0];
+        } else {
+            // 否则扫描所有
+            foreach ($args as $arg) {
+                if (is_array($arg) && isset($arg['cid'])) {
+                    $comment_array = $arg;
+                    break;
+                }
+            }
+        }
+
+        // 原有路径计算作为 fallback（总是执行）
+        $req = new Typecho_Request();
+        $original_url = preg_replace('/\/comment$/i', '', $req->getPathInfo());
+
+        $path_info = $original_url;  // 默认 fallback
+
+        if ($comment_array) {
+            // 新增：基于评论查询文章精确路径
+            $db = Typecho_Db::get();
+            $post = $db->fetchRow($db->select('cid', 'type')->from('table.contents')->where('cid = ?', $comment_array['cid']));
+
+            if ($post) {
+                $type = $post['type'];
+                $routeExists = (NULL != Typecho_Router::get($type));
+
+                if ($routeExists) {
+                    $contents = $db->fetchRow($db->select()->from('table.contents')->where('cid = ?', $post['cid']));
+                    $contents['categories'] = $db->fetchAll($db->select()->from('table.metas')
+                        ->join('table.relationships', 'table.relationships.mid = table.metas.mid')
+                        ->where('table.relationships.cid = ?', $post['cid'])
+                        ->where('table.metas.type = ?', 'category')
+                        ->order('table.metas.order', Typecho_Db::SORT_ASC));
+                    $contents['category'] = urlencode(current(Typecho_Common::arrayFlatten($contents['categories'], 'slug')));
+                    $contents['slug'] = urlencode($contents['slug']);
+                    $contents['date'] = new Typecho_Date($contents['created']);
+                    $contents['year'] = $contents['date']->year;
+                    $contents['month'] = $contents['date']->month;
+                    $contents['day'] = $contents['date']->day;
+
+                    // 生成精确文章路径
+                    $path_info = Typecho_Router::url($type, $contents);
+                }
+            }
+        }
+
+        // 执行删除，并添加调试
+        // 新增：强制删除缓存键，绕过 init 检查
+        self::init_driver();  // 强制初始化驱动
+        if (self::$cache) {
+            $prefix = Typecho_Request::getInstance()->getUrlPrefix();
+            $article_key = md5($prefix . $path_info);
+            $home_key = md5($prefix . '/');
+            $result_article = self::$cache->delete($article_key);
+            $result_home = self::$cache->delete($home_key);
+            // 变体：无 trailing slash
+            $no_slash_path = rtrim($path_info, '/');
+            if ($no_slash_path !== $path_info) {
+                self::$cache->delete(md5($prefix . $no_slash_path));
+            }
+            // 变体：带 trailing slash
+            $with_slash_path = $path_info . (substr($path_info, -1) === '/' ? '' : '/');
+            if ($with_slash_path !== $path_info) {
+                self::$cache->delete(md5($prefix . $with_slash_path));
+            }
+            if (self::$plugin_config->is_debug == '1') {
+                echo "<!-- TpRedis Debug: Forced delete article key $article_key (result: " . ($result_article ? 'success' : 'fail') . ") and home $home_key (result: " . ($result_home ? 'success' : 'fail') . ") -->";
+            }
+        } else {
+            if (self::$plugin_config->is_debug == '1') {
+                echo "<!-- TpRedis Debug: Cache driver not initialized for delete -->";
+            }
+        }
+
+        // 如果 fallback 不同，额外删
+        if ($original_url !== $path_info && self::init($original_url)) {
+            self::delete($original_url);
+            if (self::$plugin_config->is_debug == '1') {
+                echo "<!-- TpRedis Debug: Deleted fallback $original_url -->";
+            }
+        }
+
+        // 即使 init 失败，也尝试删首页（如果配置允许）
+        if (self::init('/')) {
+            self::delete('/');
+            if (self::$plugin_config->is_debug == '1') {
+                echo "<!-- TpRedis Debug: Deleted home anyway -->";
+            }
+        }
+    }
+
+    /**
+     * 评论审核更新缓存
+     *
+     * @access public
+     * @param array $comment 评论结构
+     * @param Widget_Comments_Edit $edit 编辑对象
+     * @return void
+     */
+    public static function comment_approve_update($comment, $edit)
+    {
+        if (self::$plugin_config->auto_flush_on_approve == '0') {
+            return;
+        }
+
+        // 只在状态变为 'approved' 时处理
+        if ($edit->status == 'approved' && $edit->__get('originalStatus') != 'approved') {
+            // 获取评论所属文章的路径
+            $db = Typecho_Db::get();
+            $post = $db->fetchRow($db->select('cid', 'type')->from('table.contents')->where('cid = ?', $edit->cid));
+
+            if (!$post) {
+                return;
+            }
+
+            $type = $post['type'];
+            $routeExists = (NULL != Typecho_Router::get($type));
+
+            if ($routeExists) {
+                $contents = $db->fetchRow($db->select()->from('table.contents')->where('cid = ?', $post['cid']));
+                $contents['categories'] = $db->fetchAll($db->select()->from('table.metas')
+                    ->join('table.relationships', 'table.relationships.mid = table.metas.mid')
+                    ->where('table.relationships.cid = ?', $post['cid'])
+                    ->where('table.metas.type = ?', 'category')
+                    ->order('table.metas.order', Typecho_Db::SORT_ASC));
+                $contents['category'] = urlencode(current(Typecho_Common::arrayFlatten($contents['categories'], 'slug')));
+                $contents['slug'] = urlencode($contents['slug']);
+                $contents['date'] = new Typecho_Date($contents['created']);
+                $contents['year'] = $contents['date']->year;
+                $contents['month'] = $contents['date']->month;
+                $contents['day'] = $contents['date']->day;
+
+                // 生成文章路径
+                $path_info = Typecho_Router::url($type, $contents);
+
+                if (self::init($path_info)) {
+                    if (self::$plugin_config->auto_flush_on_approve == '2') {
+                        self::$cache->flush();
+                    } else {
+                        self::delete($path_info);
+                    }
+                }
+            }
+        }
     }
 
     /**
